@@ -1,63 +1,28 @@
 # Gestion universitaire
 
-Application Python de gestion universitaire pour :
-- l'inscription des étudiants ;
-- la saisie et le suivi des notes par UE ;
-- le suivi des paiements et des soldes ;
-- la génération de documents PDF (certificat, bulletin, reçu, liste) ;
-- l'export vers Excel.
+Ce projet a été préparé pour l'hébergement web.
 
-## Technologie
-- Python 3
-- Tkinter
-- pandas
-- numpy
-- reportlab
-- openpyxl
+## Stack
+- Python
+- Flask
+- Gunicorn
 
-## Structure du projet
-
-```text
-.
-├── gestion_universitaire.py
-├── requirements.txt
-├── README.md
-├── .gitignore
-├── donnees/
-│   └── .gitkeep
-├── documents/
-│   └── .gitkeep
-└── .venv/   # à créer localement
-```
-
-## Installation
-
-1. Crée un environnement virtuel :
+## Lancement local
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Linux/Mac
-# ou .venv\Scripts\activate  # Windows
-```
-
-2. Installe les dépendances :
-
-```bash
+source .venv/bin/activate
 pip install -r requirements.txt
+python app.py
 ```
 
-3. Lance le logiciel :
+## Hébergement
 
-```bash
-python gestion_universitaire.py
-```
+Le projet est prêt pour un déploiement sur Render via le fichier `render.yaml`.
 
-## Fichiers générés
+1. Connecte le dépôt GitHub sur Render.
+2. Sélectionne le service web.
+3. Render détecte automatiquement `render.yaml`.
+4. La URL publique est générée par Render après le premier déploiement.
 
-- `donnees/ecole.xlsx` : base de données Excel du projet
-- `documents/*.pdf` : certificats, bulletins, reçus, listes
-
-## Remarques
-
-- Les fichiers Excel et PDF générés ne sont pas versionnés par défaut.
-- Le dépôt contient uniquement le code source, la configuration et la structure du projet.
+Remarque : la vraie logique métier du système universitaire n'est pas encore présente dans ce dépôt. Ce scaffold sert de base de déploiement web prête à recevoir l'application complète.
