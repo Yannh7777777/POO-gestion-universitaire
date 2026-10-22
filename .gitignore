@@ -1,0 +1,39 @@
+# .gitignore
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Visual Studio / IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Exports et données locales
+*.log
+*.sqlite3
+*.db
+
+# Données de l'application
+# On garde le dossier mais on ignore les fichiers Excel générés
+# pour éviter de versionner les données sensibles / locales.
+donnees/*.xlsx
+!donnees/.gitkeep
+
+# Documents PDF générés
+documents/*.pdf
+!documents/.gitkeep
+
+# Fichiers temporaires
+*.tmp
+*.bak

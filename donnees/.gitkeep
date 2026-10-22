@@ -1,0 +1,822 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Gestion universitaire
+---------------------
+Fonctions : inscription des étudiants, enregistrement des notes (UE / crédits),
+coordonnées, suivi des paiements et production de documents administratifs (PDF).
+
+Bibliothèques : tkinter, pandas, numpy, reportlab, openpyxl (Excel)
+Installation  : pip install -r requirements.txt
+Lancement     : python gestion_universitaire.py
+
+Les données sont stockées dans donnees/ecole.xlsx (3 feuilles :
+Etudiants, Notes, Paiements). Les PDF sont créés dans documents/.
+Les anciens fichiers (Classe / Trimestre / Coefficient) sont migrés automatiquement.
+"""
+
+import os
+import re
+import sys
+import subprocess
+from pathlib import Path
+from datetime import date, datetime
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import numpy as np
+import pandas as pd
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+BASE_DIR = Path(__file__).resolve().parent
+DOSSIER_DONNEES = BASE_DIR / "donnees"
+DOSSIER_DOCS = BASE_DIR / "documents"
+FICHIER = DOSSIER_DONNEES / "ecole.xlsx"
+
+NOM_ETABLISSEMENT = "Université"
+ANNEE_SCOLAIRE = f"{date.today().year - 1}-{date.today().year}" if date.today().month < 9 else f"{date.today().year}-{date.today().year + 1}"
+FRAIS_SCOLARITE = 300000
+DEVISE = "Ar"
+FILIERES = ["Informatique", "Gestion", "Droit", "Économie", "Lettres", "Sciences", "Médecine"]
+NIVEAUX = ["Licence 1", "Licence 2", "Licence 3", "Master 1", "Master 2"]
+SEMESTRES = ["1", "2"]
+SEUIL_VALIDATION = 10.0
+
+COL_ETUD = [
+    "Matricule", "Nom", "Prenom", "DateNaissance", "Sexe", "Filiere", "Niveau",
+    "Telephone", "Email", "Adresse", "DateInscription"
+]
+COL_NOTES = ["Matricule", "Matiere", "Credits", "Note", "Semestre"]
+COL_PAIE = ["Matricule", "Date", "Montant", "Motif"]
+RENOMMAGES = {"Classe": "Niveau", "Trimestre": "Semestre", "Coefficient": "Credits"}
+
+
+def _safe_path(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+class Stockage:
+    def __init__(self, chemin=FICHIER):
+        self.chemin = Path(chemin)
+        _safe_path(self.chemin.parent)
+        _safe_path(DOSSIER_DOCS)
+        self.charger()
+
+    def charger(self):
+        if self.chemin.exists():
+            feuilles = pd.read_excel(self.chemin, sheet_name=None, dtype=str)
+        else:
+            feuilles = {}
+        self.etudiants = self._feuille(feuilles, "Etudiants", COL_ETUD)
+        self.notes = self._feuille(feuilles, "Notes", COL_NOTES)
+        self.paiements = self._feuille(feuilles, "Paiements", COL_PAIE)
+        self._typer()
+
+    @staticmethod
+    def _feuille(feuilles, nom, colonnes):
+        df = feuilles.get(nom)
+        if df is None:
+            return pd.DataFrame(columns=colonnes)
+        df = df.rename(columns=RENOMMAGES)
+        for c in colonnes:
+            if c not in df.columns:
+                df[c] = ""
+        return df[colonnes].fillna("").reset_index(drop=True)
+
+    def _typer(self):
+        self.notes["Credits"] = pd.to_numeric(self.notes["Credits"], errors="coerce")
+        self.notes["Note"] = pd.to_numeric(self.notes["Note"], errors="coerce")
+        self.paiements["Montant"] = pd.to_numeric(self.paiements["Montant"], errors="coerce")
+
+    def sauvegarder(self):
+        try:
+            with pd.ExcelWriter(self.chemin, engine="openpyxl") as writer:
+                self.etudiants.to_excel(writer, sheet_name="Etudiants", index=False)
+                self.notes.to_excel(writer, sheet_name="Notes", index=False)
+                self.paiements.to_excel(writer, sheet_name="Paiements", index=False)
+            return True
+        except PermissionError:
+            messagebox.showerror(
+                "Erreur",
+                "Impossible d'écrire le fichier Excel.\nFermez-le s'il est ouvert dans Excel."
+            )
+            return False
+
+    def ajouter(self, table, ligne):
+        df = getattr(self, table)
+        new_df = pd.DataFrame([ligne], columns=df.columns)
+        setattr(self, table, new_df if df.empty else pd.concat([df, new_df], ignore_index=True))
+        self._typer()
+
+    def nouveau_matricule(self):
+        prefixe = f"{date.today().year}-"
+        mats = self.etudiants["Matricule"].astype(str)
+        numeros = [
+            int(m.split("-")[1]) for m in mats
+            if m.startswith(prefixe) and m.split("-")[1].isdigit()
+        ]
+        return f"{prefixe}{(max(numeros) if numeros else 0) + 1:04d}"
+
+    def etudiant(self, matricule):
+        ligne = self.etudiants[self.etudiants["Matricule"] == matricule]
+        return None if ligne.empty else ligne.iloc[0]
+
+    def notes_semestre(self, matricule, semestre):
+        return self.notes[(self.notes["Matricule"] == matricule) & (self.notes["Semestre"].astype(str) == str(semestre))]
+
+    def moyenne(self, matricule, semestre):
+        n = self.notes_semestre(matricule, semestre).dropna(subset=["Note", "Credits"])
+        if n.empty or n["Credits"].sum() == 0:
+            return None
+        return float(np.average(n["Note"], weights=n["Credits"]))
+
+    def credits_valides(self, matricule, semestre):
+        n = self.notes_semestre(matricule, semestre).dropna(subset=["Note", "Credits"])
+        return float(n.loc[n["Note"] >= SEUIL_VALIDATION, "Credits"].sum()), float(n["Credits"].sum())
+
+    def classement(self, niveau, filiere, semestre):
+        etuds = self.etudiants.loc[(self.etudiants["Niveau"] == niveau) & (self.etudiants["Filiere"] == filiere), "Matricule"]
+        scores = {m: self.moyenne(m, semestre) for m in etuds}
+        valides = {m: v for m, v in scores.items() if v is not None}
+        ordre = sorted(valides.values(), reverse=True)
+        return {m: (v, ordre.index(v) + 1) for m, v in valides.items()}, len(valides)
+
+    def total_paye(self, matricule):
+        p = self.paiements[self.paiements["Matricule"] == matricule]["Montant"]
+        return float(p.sum()) if len(p) else 0.0
+
+
+def mention(moy):
+    if moy is None:
+        return "-"
+    bornes = [16, 14, 12, 10]
+    noms = ["Très bien", "Bien", "Assez bien", "Passable"]
+    for b, n in zip(bornes, noms):
+        if moy >= b:
+            return n
+    return "Insuffisant"
+
+
+def fmt_montant(x):
+    return f"{x:,.0f} {DEVISE}".replace(",", " ")
+
+
+def nom_fichier(texte):
+    return re.sub(r"[^\w\-]+", "_", str(texte), flags=re.UNICODE).strip("_")
+
+
+def ouvrir_fichier(chemin):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(chemin)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", chemin])
+        else:
+            subprocess.Popen(["xdg-open", chemin])
+    except Exception:
+        pass
+
+
+class Documents:
+    def __init__(self, db: Stockage):
+        self.db = db
+        base = getSampleStyleSheet()
+        self.titre = ParagraphStyle("titre", parent=base["Title"], fontSize=18, spaceAfter=14)
+        self.entete = ParagraphStyle("entete", parent=base["Normal"], fontSize=11, alignment=1, textColor=colors.HexColor("#333333"))
+        self.corps = ParagraphStyle("corps", parent=base["Normal"], fontSize=12, leading=20)
+        self.droite = ParagraphStyle("droite", parent=base["Normal"], alignment=2, fontSize=11)
+
+    def _doc(self, nom, taille=A4):
+        chemin = str(DOSSIER_DOCS / nom)
+        document = SimpleDocTemplate(
+            chemin,
+            pagesize=taille,
+            leftMargin=2 * cm,
+            rightMargin=2 * cm,
+            topMargin=2 * cm,
+            bottomMargin=2 * cm,
+        )
+        return chemin, document
+
+    def _entete(self):
+        return [
+            Paragraph(f"<b>{NOM_ETABLISSEMENT}</b>", self.entete),
+            Paragraph(f"Année universitaire {ANNEE_SCOLAIRE}", self.entete),
+            Spacer(1, 1 * cm),
+        ]
+
+    @staticmethod
+    def _style_table(entete=True, taille=None):
+        s = [
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f3f3")]),
+        ]
+        if taille:
+            s.append(("FONTSIZE", (0, 0), (-1, -1), taille))
+        if entete:
+            s += [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        return TableStyle(s)
+
+    def certificat(self, matricule):
+        e = self.db.etudiant(matricule)
+        chemin, doc = self._doc(f"certificat_{matricule}.pdf")
+        genre = "Madame/Mademoiselle" if e["Sexe"] == "F" else "Monsieur"
+        nee = "née" if e["Sexe"] == "F" else "né"
+        elements = self._entete()
+        elements += [
+            Paragraph("CERTIFICAT DE SCOLARITÉ", self.titre),
+            Spacer(1, 0.8 * cm),
+            Paragraph(
+                f"Le Président de l'<b>{NOM_ETABLISSEMENT}</b> certifie que {genre} <b>{e['Nom'].upper()} {e['Prenom']}</b>, {nee} le <b>{e['DateNaissance']}</b>, matricule <b>{e['Matricule']}</b>, est régulièrement inscrit(e) en <b>{e['Niveau']}</b>, filière <b>{e['Filiere']}</b>, pour l'année universitaire <b>{ANNEE_SCOLAIRE}</b>.",
+                self.corps,
+            ),
+            Spacer(1, 0.6 * cm),
+            Paragraph("Ce certificat est délivré pour servir et valoir ce que de droit.", self.corps),
+            Spacer(1, 2 * cm),
+            Paragraph(f"Fait le {date.today().strftime('%d/%m/%Y')}", self.droite),
+            Spacer(1, 0.5 * cm),
+            Paragraph("Le Président", self.droite),
+        ]
+        doc.build(elements)
+        return chemin
+
+    def bulletin(self, matricule, semestre):
+        e = self.db.etudiant(matricule)
+        notes = self.db.notes_semestre(matricule, semestre)
+        if notes.empty:
+            raise ValueError("Aucune note enregistrée pour ce semestre.")
+        classement, effectif = self.db.classement(e["Niveau"], e["Filiere"], semestre)
+        moyenne, rang = classement.get(matricule, (None, None))
+        acquis, total = self.db.credits_valides(matricule, semestre)
+
+        lignes = [["UE / Matière", "Crédits", "Note /20", "Note × Crédits", "Résultat"]]
+        for _, r in notes.iterrows():
+            ok = r["Note"] >= SEUIL_VALIDATION
+            lignes.append([
+                r["Matiere"],
+                f"{r['Credits']:g}",
+                f"{r['Note']:.2f}",
+                f"{r['Note'] * r['Credits']:.2f}",
+                "Validée" if ok else "Non validée",
+            ])
+        table = Table(lignes, colWidths=[6.5 * cm, 2.3 * cm, 2.5 * cm, 3.2 * cm, 2.5 * cm])
+        table.setStyle(self._style_table())
+
+        decision = "Semestre validé" if moyenne is not None and moyenne >= SEUIL_VALIDATION else "Semestre non validé"
+        chemin, doc = self._doc(f"bulletin_{matricule}_S{semestre}.pdf")
+        elements = self._entete()
+        elements += [
+            Paragraph(f"RELEVÉ DE NOTES — SEMESTRE {semestre}", self.titre),
+            Paragraph(f"<b>Étudiant :</b> {e['Nom'].upper()} {e['Prenom']} &nbsp;&nbsp; <b>Matricule :</b> {matricule}", self.corps),
+            Paragraph(f"<b>Filière :</b> {e['Filiere']} &nbsp;&nbsp; <b>Niveau :</b> {e['Niveau']}", self.corps),
+            Spacer(1, 0.6 * cm),
+            table,
+            Spacer(1, 0.8 * cm),
+        ]
+        if moyenne is not None:
+            elements.append(Paragraph(f"<b>Moyenne du semestre :</b> {moyenne:.2f} / 20", self.corps))
+        if rang:
+            elements.append(Paragraph(f"<b>Rang :</b> {rang} / {effectif}", self.corps))
+        elements += [
+            Paragraph(f"<b>Crédits acquis (UE validées) :</b> {acquis:g} / {total:g}", self.corps),
+            Paragraph(f"<b>Mention :</b> {mention(moyenne)}", self.corps),
+            Paragraph(f"<b>Décision :</b> {decision}", self.corps),
+            Spacer(1, 1.5 * cm),
+            Paragraph(f"Édité le {date.today().strftime('%d/%m/%Y')}", self.droite),
+        ]
+        doc.build(elements)
+        return chemin
+
+    def recu(self, matricule, index_paiement):
+        e = self.db.etudiant(matricule)
+        paiement = self.db.paiements.loc[index_paiement]
+        total = self.db.total_paye(matricule)
+        reste = max(FRAIS_SCOLARITE - total, 0)
+        chemin, doc = self._doc(f"recu_{matricule}_{index_paiement}.pdf")
+        lignes = [["Date", "Motif", "Montant"], [paiement["Date"], paiement["Motif"], fmt_montant(paiement["Montant"])]]
+        table = Table(lignes, colWidths=[4 * cm, 8 * cm, 5 * cm])
+        table.setStyle(self._style_table())
+        elements = self._entete()
+        elements += [
+            Paragraph(f"REÇU DE PAIEMENT N° {int(index_paiement) + 1:05d}", self.titre),
+            Paragraph(f"Reçu de <b>{e['Nom'].upper()} {e['Prenom']}</b> (matricule {matricule}, {e['Niveau']} {e['Filiere']}).", self.corps),
+            Spacer(1, 0.6 * cm),
+            table,
+            Spacer(1, 0.8 * cm),
+            Paragraph(f"Total payé à ce jour : <b>{fmt_montant(total)}</b>", self.corps),
+            Paragraph(f"Frais de scolarité : {fmt_montant(FRAIS_SCOLARITE)}", self.corps),
+            Paragraph(f"Reste à payer : <b>{fmt_montant(reste)}</b>", self.corps),
+            Spacer(1, 1.5 * cm),
+            Paragraph("Le Comptable", self.droite),
+        ]
+        doc.build(elements)
+        return chemin
+
+    def liste(self, niveau=None, filiere=None):
+        df = self.db.etudiants
+        if niveau:
+            df = df[df["Niveau"] == niveau]
+        if filiere:
+            df = df[df["Filiere"] == filiere]
+        lignes = [["Matricule", "Nom", "Prénom", "Filière", "Niveau", "Téléphone", "Payé", "Reste"]]
+        for _, r in df.sort_values(["Filiere", "Niveau", "Nom"]).iterrows():
+            paye = self.db.total_paye(r["Matricule"])
+            lignes.append([
+                r["Matricule"],
+                r["Nom"],
+                r["Prenom"],
+                r["Filiere"],
+                r["Niveau"],
+                r["Telephone"],
+                f"{paye:,.0f}".replace(",", " "),
+                f"{max(FRAIS_SCOLARITE - paye, 0):,.0f}".replace(",", " "),
+            ])
+        table = Table(lignes, repeatRows=1)
+        table.setStyle(self._style_table(taille=9))
+        suffixe = nom_fichier("_".join(x for x in (filiere, niveau) if x)) or "tous"
+        chemin, doc = self._doc(f"liste_{suffixe}.pdf", landscape(A4))
+        details = " — ".join(x for x in (filiere, niveau) if x)
+        titre = f"LISTE DES ÉTUDIANTS — {details}" if details else "LISTE DES ÉTUDIANTS"
+        doc.build(self._entete() + [Paragraph(titre, self.titre), table])
+        return chemin
+
+
+def remplir_tree(tree, df, colonnes, formateurs=None):
+    tree.delete(*tree.get_children())
+    formateurs = formateurs or {}
+    for idx, ligne in df.iterrows():
+        valeurs = [formateurs.get(c, lambda v: str(v))(ligne[c]) for c in colonnes]
+        tree.insert("", "end", iid=str(idx), values=valeurs)
+
+
+def creer_tree(parent, colonnes, largeurs=None, hauteur=10):
+    cadre = ttk.Frame(parent)
+    tree = ttk.Treeview(cadre, columns=colonnes, show="headings", height=hauteur, selectmode="browse")
+    for i, c in enumerate(colonnes):
+        tree.heading(c, text=c)
+        tree.column(c, width=(largeurs[i] if largeurs else 110), anchor="w")
+    vs = ttk.Scrollbar(cadre, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vs.set)
+    tree.pack(side="left", fill="both", expand=True)
+    vs.pack(side="right", fill="y")
+    return cadre, tree
+
+
+class Application(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"Gestion universitaire — {NOM_ETABLISSEMENT}")
+        self.geometry("1150x720")
+        self.minsize(1000, 620)
+        self.db = Stockage()
+        self.docs = Documents(self.db)
+
+        ttk.Style(self).theme_use("clam")
+        self.statut = ttk.Label(self, anchor="w", relief="sunken")
+        self.statut.pack(fill="x", side="bottom")
+        self.onglets = ttk.Notebook(self)
+        self.onglets.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.construire_etudiants()
+        self.construire_notes()
+        self.construire_paiements()
+        self.construire_documents()
+        self.rafraichir_tout()
+
+    def maj_statut(self):
+        self.statut.config(
+            text=f"  {len(self.db.etudiants)} étudiant(s)  |  {len(self.db.notes)} note(s)  |  {len(self.db.paiements)} paiement(s)  |  Année {ANNEE_SCOLAIRE}"
+        )
+
+    def libelles_etudiants(self):
+        df = self.db.etudiants.sort_values(["Nom", "Prenom"])
+        return [f"{r['Matricule']} — {r['Nom']} {r['Prenom']}" for _, r in df.iterrows()]
+
+    @staticmethod
+    def matricule_de(libelle):
+        return libelle.split(" — ")[0].strip() if libelle else ""
+
+    def enregistrer(self):
+        if self.db.sauvegarder():
+            return True
+        self.db.charger()
+        self.rafraichir_tout()
+        return False
+
+    def rafraichir_tout(self):
+        valeurs = self.libelles_etudiants()
+        for var, combo in ((self.n_etud, self.cb_notes_etud), (self.p_etud, self.cb_paie_etud), (self.d_etud, self.cb_doc_etud)):
+            combo["values"] = valeurs
+            if var.get() not in valeurs:
+                var.set("")
+        self.filtrer_etudiants()
+        self.afficher_notes()
+        self.afficher_paiements()
+        self.maj_statut()
+
+    def generer(self, fonction, *args):
+        try:
+            chemin = fonction(*args)
+        except ValueError as err:
+            messagebox.showinfo("Document", str(err))
+            return
+        except PermissionError:
+            messagebox.showerror("Erreur", "Impossible d'écrire le PDF.\nFermez-le s'il est ouvert dans un lecteur.")
+            return
+        messagebox.showinfo("Document créé", f"Fichier enregistré :\n{os.path.abspath(chemin)}")
+        ouvrir_fichier(chemin)
+
+    def construire_etudiants(self):
+        f = ttk.Frame(self.onglets, padding=8)
+        self.onglets.add(f, text="  Étudiants  ")
+
+        form = ttk.LabelFrame(f, text="Fiche étudiant (inscription et coordonnées)", padding=8)
+        form.pack(fill="x")
+        self.v = {k: tk.StringVar() for k in ["Matricule", "Nom", "Prenom", "DateNaissance", "Sexe", "Filiere", "Niveau", "Telephone", "Email", "Adresse"]}
+        self.v["Sexe"].set("M")
+        champs = [
+            ("Matricule", "Matricule"), ("Nom", "Nom"), ("Prenom", "Prénom"),
+            ("DateNaissance", "Naissance (JJ/MM/AAAA)"), ("Sexe", "Sexe"),
+            ("Filiere", "Filière"), ("Niveau", "Niveau"), ("Telephone", "Téléphone"),
+            ("Email", "Email"), ("Adresse", "Adresse"),
+        ]
+        for i, (cle, lib) in enumerate(champs):
+            r, c = divmod(i, 3)
+            ttk.Label(form, text=lib).grid(row=r, column=c * 2, sticky="e", padx=4, pady=3)
+            if cle == "Sexe":
+                w = ttk.Combobox(form, textvariable=self.v[cle], values=["M", "F"], state="readonly", width=18)
+            elif cle == "Filiere":
+                w = ttk.Combobox(form, textvariable=self.v[cle], values=FILIERES, width=18)
+            elif cle == "Niveau":
+                w = ttk.Combobox(form, textvariable=self.v[cle], values=NIVEAUX, state="readonly", width=18)
+            else:
+                w = ttk.Entry(form, textvariable=self.v[cle], width=21, state="readonly" if cle == "Matricule" else "normal")
+            w.grid(row=r, column=c * 2 + 1, sticky="w", padx=4, pady=3)
+
+        barre = ttk.Frame(f)
+        barre.pack(fill="x", pady=6)
+        ttk.Button(barre, text="Inscrire", command=self.inscrire).pack(side="left", padx=2)
+        ttk.Button(barre, text="Modifier", command=self.modifier_etudiant).pack(side="left", padx=2)
+        ttk.Button(barre, text="Supprimer", command=self.supprimer_etudiant).pack(side="left", padx=2)
+        ttk.Button(barre, text="Nouveau", command=self.vider_formulaire).pack(side="left", padx=2)
+        ttk.Label(barre, text="   Rechercher :").pack(side="left")
+        self.recherche = tk.StringVar()
+        self.recherche.trace_add("write", lambda *_: self.filtrer_etudiants())
+        ttk.Entry(barre, textvariable=self.recherche, width=22).pack(side="left", padx=4)
+        self.filtre_niveau = tk.StringVar(value="Tous")
+        cb = ttk.Combobox(barre, textvariable=self.filtre_niveau, values=["Tous"] + NIVEAUX, state="readonly", width=10)
+        cb.pack(side="left", padx=2)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.filtrer_etudiants())
+        self.filtre_filiere = tk.StringVar(value="Toutes")
+        cb2 = ttk.Combobox(barre, textvariable=self.filtre_filiere, values=["Toutes"] + FILIERES, state="readonly", width=12)
+        cb2.pack(side="left", padx=2)
+        cb2.bind("<<ComboboxSelected>>", lambda e: self.filtrer_etudiants())
+
+        self.cols_etud = ["Matricule", "Nom", "Prenom", "DateNaissance", "Sexe", "Filiere", "Niveau", "Telephone", "Email"]
+        cadre, self.tree_etud = creer_tree(f, self.cols_etud, [95, 130, 130, 100, 45, 100, 85, 105, 190], 12)
+        cadre.pack(fill="both", expand=True)
+        self.tree_etud.bind("<<TreeviewSelect>>", self.selection_etudiant)
+
+    def filtrer_etudiants(self):
+        df = self.db.etudiants
+        q = self.recherche.get().strip().lower()
+        if q:
+            masque = df[["Matricule", "Nom", "Prenom", "Telephone", "Email"]].apply(lambda col: col.astype(str).str.lower().str.contains(q, regex=False)).any(axis=1)
+            df = df[masque]
+        if self.filtre_niveau.get() != "Tous":
+            df = df[df["Niveau"] == self.filtre_niveau.get()]
+        if self.filtre_filiere.get() != "Toutes":
+            df = df[df["Filiere"] == self.filtre_filiere.get()]
+        remplir_tree(self.tree_etud, df.sort_values("Nom"), self.cols_etud)
+
+    def selection_etudiant(self, _=None):
+        sel = self.tree_etud.selection()
+        if not sel:
+            return
+        ligne = self.db.etudiants.loc[int(sel[0])]
+        for cle in self.v:
+            self.v[cle].set(ligne[cle])
+
+    def vider_formulaire(self):
+        for cle, var in self.v.items():
+            var.set("M" if cle == "Sexe" else "")
+        self.tree_etud.selection_remove(self.tree_etud.selection())
+
+    def valider_formulaire(self):
+        d = {k: var.get().strip() for k, var in self.v.items()}
+        if not d["Nom"] or not d["Prenom"] or not d["Filiere"] or not d["Niveau"]:
+            messagebox.showwarning("Champs requis", "Nom, prénom, filière et niveau sont obligatoires.")
+            return False
+        try:
+            naissance = datetime.strptime(d["DateNaissance"], "%d/%m/%Y").date()
+        except ValueError:
+            messagebox.showwarning("Date invalide", "Format attendu : JJ/MM/AAAA")
+            return False
+        if naissance >= date.today():
+            messagebox.showwarning("Date invalide", "La date de naissance doit être dans le passé.")
+            return False
+        if d["Email"] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", d["Email"]):
+            messagebox.showwarning("Email invalide", "Adresse email incorrecte.")
+            return False
+        return True
+
+    def inscrire(self):
+        if not self.valider_formulaire():
+            return
+        d = {k: var.get().strip() for k, var in self.v.items()}
+        e = self.db.etudiants
+        doublon = e[(e["Nom"].str.lower() == d["Nom"].lower()) & (e["Prenom"].str.lower() == d["Prenom"].lower()) & (e["DateNaissance"] == d["DateNaissance"])]
+        if not doublon.empty:
+            messagebox.showwarning("Doublon", "Cet étudiant est déjà inscrit.")
+            return
+        d["Matricule"] = self.db.nouveau_matricule()
+        d["DateInscription"] = date.today().strftime("%d/%m/%Y")
+        self.db.ajouter("etudiants", d)
+        if not self.enregistrer():
+            return
+        self.rafraichir_tout()
+        self.vider_formulaire()
+        messagebox.showinfo("Inscription", f"Étudiant inscrit.\nMatricule : {d['Matricule']}")
+
+    def modifier_etudiant(self):
+        mat = self.v["Matricule"].get()
+        if not mat:
+            messagebox.showinfo("Modifier", "Sélectionnez d'abord un étudiant dans la liste.")
+            return
+        if not self.valider_formulaire():
+            return
+        masque = self.db.etudiants["Matricule"] == mat
+        for cle, var in self.v.items():
+            self.db.etudiants.loc[masque, cle] = var.get().strip()
+        if not self.enregistrer():
+            return
+        self.rafraichir_tout()
+        messagebox.showinfo("Modifier", "Informations mises à jour.")
+
+    def supprimer_etudiant(self):
+        mat = self.v["Matricule"].get()
+        if not mat:
+            messagebox.showinfo("Supprimer", "Sélectionnez d'abord un étudiant dans la liste.")
+            return
+        if not messagebox.askyesno("Confirmation", f"Supprimer {mat} ainsi que ses notes et paiements ?"):
+            return
+        db = self.db
+        db.etudiants = db.etudiants[db.etudiants["Matricule"] != mat].reset_index(drop=True)
+        db.notes = db.notes[db.notes["Matricule"] != mat].reset_index(drop=True)
+        db.paiements = db.paiements[db.paiements["Matricule"] != mat].reset_index(drop=True)
+        if not self.enregistrer():
+            return
+        self.vider_formulaire()
+        self.rafraichir_tout()
+
+    def construire_notes(self):
+        f = ttk.Frame(self.onglets, padding=8)
+        self.onglets.add(f, text="  Notes  ")
+        form = ttk.LabelFrame(f, text="Enregistrement d'une note (UE)", padding=8)
+        form.pack(fill="x")
+
+        self.n_etud = tk.StringVar()
+        self.n_coef, self.n_note = tk.StringVar(value="1"), tk.StringVar()
+        self.n_trim = tk.StringVar(value="1")
+
+        ttk.Label(form, text="Étudiant").grid(row=0, column=0, sticky="e", padx=4, pady=3)
+        self.cb_notes_etud = ttk.Combobox(form, textvariable=self.n_etud, width=38, state="readonly")
+        self.cb_notes_etud.grid(row=0, column=1, columnspan=3, sticky="w", padx=4)
+        self.cb_notes_etud.bind("<<ComboboxSelected>>", lambda e: self.afficher_notes())
+        ttk.Label(form, text="Semestre").grid(row=0, column=4, sticky="e", padx=4)
+        cb = ttk.Combobox(form, textvariable=self.n_trim, values=SEMESTRES, width=5, state="readonly")
+        cb.grid(row=0, column=5, sticky="w")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.afficher_notes())
+
+        ttk.Label(form, text="UE / Matière").grid(row=1, column=0, sticky="e", padx=4, pady=3)
+        self.n_matiere = tk.StringVar()
+        ttk.Entry(form, textvariable=self.n_matiere, width=25).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(form, text="Crédits").grid(row=1, column=2, sticky="e", padx=4)
+        ttk.Entry(form, textvariable=self.n_coef, width=8).grid(row=1, column=3, sticky="w")
+        ttk.Label(form, text="Note /20").grid(row=1, column=4, sticky="e", padx=4)
+        ttk.Entry(form, textvariable=self.n_note, width=8).grid(row=1, column=5, sticky="w")
+        ttk.Button(form, text="Enregistrer la note", command=self.ajouter_note).grid(row=1, column=6, padx=10)
+
+        barre = ttk.Frame(f)
+        barre.pack(fill="x", pady=6)
+        ttk.Button(barre, text="Supprimer la note sélectionnée", command=self.supprimer_note).pack(side="left")
+        self.lbl_moyenne = ttk.Label(barre, text="", font=("TkDefaultFont", 11, "bold"))
+        self.lbl_moyenne.pack(side="right")
+
+        cadre, self.tree_notes = creer_tree(f, ["Matiere", "Credits", "Note", "Semestre"], [250, 100, 100, 100], 14)
+        cadre.pack(fill="both", expand=True)
+
+    def ajouter_note(self):
+        mat = self.matricule_de(self.n_etud.get())
+        if not mat:
+            messagebox.showwarning("Note", "Choisissez un étudiant.")
+            return
+        matiere = self.n_matiere.get().strip()
+        try:
+            note = float(self.n_note.get().replace(",", "."))
+            credits = float(self.n_coef.get().replace(",", "."))
+        except ValueError:
+            messagebox.showwarning("Note", "Note et crédits doivent être numériques.")
+            return
+        if not matiere or not 0 <= note <= 20 or credits <= 0:
+            messagebox.showwarning("Note", "UE requise, note entre 0 et 20, crédits > 0.")
+            return
+        deja = self.db.notes_semestre(mat, self.n_trim.get())
+        if (deja["Matiere"].str.lower() == matiere.lower()).any():
+            messagebox.showwarning("Note", "Cette UE a déjà une note pour ce semestre.\nSupprimez l'ancienne avant d'en saisir une nouvelle.")
+            return
+        self.db.ajouter("notes", {"Matricule": mat, "Matiere": matiere, "Credits": credits, "Note": note, "Semestre": self.n_trim.get()})
+        if not self.enregistrer():
+            return
+        self.n_matiere.set("")
+        self.n_note.set("")
+        self.afficher_notes()
+        self.maj_statut()
+
+    def supprimer_note(self):
+        sel = self.tree_notes.selection()
+        if not sel:
+            return
+        self.db.notes = self.db.notes.drop(index=int(sel[0])).reset_index(drop=True)
+        if not self.enregistrer():
+            return
+        self.afficher_notes()
+        self.maj_statut()
+
+    def afficher_notes(self):
+        mat = self.matricule_de(self.n_etud.get())
+        notes = self.db.notes_semestre(mat, self.n_trim.get())
+        remplir_tree(self.tree_notes, notes, ["Matiere", "Credits", "Note", "Semestre"], {"Credits": lambda x: f"{x:g}", "Note": lambda x: f"{x:.2f}"})
+        moyenne = self.db.moyenne(mat, self.n_trim.get()) if mat else None
+        self.lbl_moyenne.config(text=f"Moyenne : {moyenne:.2f}/20 — {mention(moyenne)}" if moyenne is not None else "Moyenne : -")
+
+    def construire_paiements(self):
+        f = ttk.Frame(self.onglets, padding=8)
+        self.onglets.add(f, text="  Paiements  ")
+        form = ttk.LabelFrame(f, text="Enregistrement d'un paiement", padding=8)
+        form.pack(fill="x")
+        self.p_etud = tk.StringVar()
+        self.p_montant, self.p_motif = tk.StringVar(), tk.StringVar(value="Frais de scolarité")
+        self.p_date = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
+
+        ttk.Label(form, text="Étudiant").grid(row=0, column=0, sticky="e", padx=4, pady=3)
+        self.cb_paie_etud = ttk.Combobox(form, textvariable=self.p_etud, width=38, state="readonly")
+        self.cb_paie_etud.grid(row=0, column=1, columnspan=3, sticky="w", padx=4)
+        self.cb_paie_etud.bind("<<ComboboxSelected>>", lambda e: self.afficher_paiements())
+        ttk.Label(form, text="Date").grid(row=1, column=0, sticky="e", padx=4, pady=3)
+        ttk.Entry(form, textvariable=self.p_date, width=14).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(form, text=f"Montant ({DEVISE})").grid(row=1, column=2, sticky="e", padx=4)
+        ttk.Entry(form, textvariable=self.p_montant, width=14).grid(row=1, column=3, sticky="w")
+        ttk.Label(form, text="Motif").grid(row=1, column=4, sticky="e", padx=4)
+        ttk.Entry(form, textvariable=self.p_motif, width=24).grid(row=1, column=5, sticky="w")
+        ttk.Button(form, text="Enregistrer", command=self.ajouter_paiement).grid(row=1, column=6, padx=10)
+
+        barre = ttk.Frame(f)
+        barre.pack(fill="x", pady=6)
+        ttk.Button(barre, text="Supprimer le paiement sélectionné", command=self.supprimer_paiement).pack(side="left")
+        ttk.Button(barre, text="Imprimer le reçu (PDF)", command=self.imprimer_recu).pack(side="left", padx=6)
+        self.lbl_solde = ttk.Label(barre, text="", font=("TkDefaultFont", 11, "bold"))
+        self.lbl_solde.pack(side="right")
+
+        cadre, self.tree_paie = creer_tree(f, ["Date", "Montant", "Motif"], [120, 140, 300], 7)
+        cadre.pack(fill="x")
+
+        ttk.Label(f, text="Situation de tous les étudiants", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(10, 2))
+        cadre2, self.tree_solde = creer_tree(f, ["Matricule", "Nom", "Filière", "Niveau", "Payé", "Reste", "Statut"], [100, 230, 110, 90, 120, 120, 90], 8)
+        cadre2.pack(fill="both", expand=True)
+
+    def ajouter_paiement(self):
+        mat = self.matricule_de(self.p_etud.get())
+        if not mat:
+            messagebox.showwarning("Paiement", "Choisissez un étudiant.")
+            return
+        try:
+            montant = float(self.p_montant.get().replace(" ", "").replace(",", "."))
+            datetime.strptime(self.p_date.get().strip(), "%d/%m/%Y")
+        except ValueError:
+            messagebox.showwarning("Paiement", "Montant numérique et date JJ/MM/AAAA requis.")
+            return
+        if montant <= 0:
+            messagebox.showwarning("Paiement", "Le montant doit être positif.")
+            return
+        self.db.ajouter("paiements", {"Matricule": mat, "Date": self.p_date.get().strip(), "Montant": montant, "Motif": self.p_motif.get().strip()})
+        if not self.enregistrer():
+            return
+        self.p_montant.set("")
+        self.afficher_paiements()
+        self.maj_statut()
+        if messagebox.askyesno("Reçu", "Paiement enregistré. Imprimer le reçu ?"):
+            self.generer(self.docs.recu, mat, self.db.paiements.index[-1])
+
+    def supprimer_paiement(self):
+        sel = self.tree_paie.selection()
+        if sel and messagebox.askyesno("Confirmation", "Supprimer ce paiement ?"):
+            self.db.paiements = self.db.paiements.drop(index=int(sel[0])).reset_index(drop=True)
+            if not self.enregistrer():
+                return
+            self.afficher_paiements()
+            self.maj_statut()
+
+    def imprimer_recu(self):
+        sel = self.tree_paie.selection()
+        if not sel:
+            messagebox.showinfo("Reçu", "Sélectionnez un paiement dans la liste.")
+            return
+        mat = self.matricule_de(self.p_etud.get())
+        self.generer(self.docs.recu, mat, int(sel[0]))
+
+    def afficher_paiements(self):
+        mat = self.matricule_de(self.p_etud.get())
+        paiements = self.db.paiements[self.db.paiements["Matricule"] == mat]
+        remplir_tree(self.tree_paie, paiements, ["Date", "Montant", "Motif"], {"Montant": fmt_montant})
+        if mat:
+            total = self.db.total_paye(mat)
+            self.lbl_solde.config(text=f"Payé : {fmt_montant(total)}  |  Reste : {fmt_montant(max(FRAIS_SCOLARITE - total, 0))}")
+        else:
+            self.lbl_solde.config("")
+
+        etuds = self.db.etudiants.copy()
+        paye = self.db.paiements.groupby("Matricule")["Montant"].sum()
+        etuds["Paye"] = etuds["Matricule"].map(paye).fillna(0.0).astype(float)
+        etuds["Reste"] = np.maximum(FRAIS_SCOLARITE - etuds["Paye"], 0)
+        etuds["Statut"] = np.select([etuds["Reste"] == 0, etuds["Paye"] > 0], ["Soldé", "Partiel"], "Impayé")
+        etuds["NomComplet"] = etuds["Nom"].str.upper() + " " + etuds["Prenom"]
+        self.tree_solde.delete(*self.tree_solde.get_children())
+        for _, r in etuds.sort_values("Nom").iterrows():
+            self.tree_solde.insert("", "end", values=(r["Matricule"], r["NomComplet"], r["Filiere"], r["Niveau"], fmt_montant(r["Paye"]), fmt_montant(r["Reste"]), r["Statut"]))
+
+    def construire_documents(self):
+        f = ttk.Frame(self.onglets, padding=16)
+        self.onglets.add(f, text="  Documents  ")
+
+        box = ttk.LabelFrame(f, text="Documents individuels", padding=12)
+        box.pack(fill="x")
+        self.d_etud, self.d_trim = tk.StringVar(), tk.StringVar(value="1")
+        ttk.Label(box, text="Étudiant").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.cb_doc_etud = ttk.Combobox(box, textvariable=self.d_etud, width=40, state="readonly")
+        self.cb_doc_etud.grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(box, text="Semestre").grid(row=0, column=2, sticky="e", padx=4)
+        ttk.Combobox(box, textvariable=self.d_trim, values=SEMESTRES, width=5, state="readonly").grid(row=0, column=3, sticky="w")
+        ttk.Button(box, text="Certificat de scolarité", command=self.doc_certificat).grid(row=1, column=0, pady=10, padx=4)
+        ttk.Button(box, text="Relevé de notes", command=self.doc_bulletin).grid(row=1, column=1, pady=10, sticky="w")
+
+        box2 = ttk.LabelFrame(f, text="Documents collectifs et exports", padding=12)
+        box2.pack(fill="x", pady=14)
+        self.d_niveau = tk.StringVar(value="Tous")
+        self.d_filiere = tk.StringVar(value="Toutes")
+        ttk.Label(box2, text="Niveau").grid(row=0, column=0, padx=4)
+        ttk.Combobox(box2, textvariable=self.d_niveau, values=["Tous"] + NIVEAUX, width=12, state="readonly").grid(row=0, column=1, padx=4)
+        ttk.Label(box2, text="Filière").grid(row=0, column=2, padx=4)
+        ttk.Combobox(box2, textvariable=self.d_filiere, values=["Toutes"] + FILIERES, width=14, state="readonly").grid(row=0, column=3, padx=4)
+        ttk.Button(box2, text="Liste des étudiants (PDF)", command=self.doc_liste).grid(row=0, column=4, padx=10)
+        ttk.Button(box2, text="Exporter vers Excel…", command=self.exporter_excel).grid(row=0, column=5, padx=10)
+
+    def _etudiant_choisi(self):
+        mat = self.matricule_de(self.d_etud.get())
+        if not mat:
+            messagebox.showwarning("Document", "Choisissez un étudiant.")
+        return mat
+
+    def doc_certificat(self):
+        mat = self._etudiant_choisi()
+        if mat:
+            self.generer(self.docs.certificat, mat)
+
+    def doc_bulletin(self):
+        mat = self._etudiant_choisi()
+        if mat:
+            self.generer(self.docs.bulletin, mat, self.d_trim.get())
+
+    def doc_liste(self):
+        niveau = None if self.d_niveau.get() == "Tous" else self.d_niveau.get()
+        filiere = None if self.d_filiere.get() == "Toutes" else self.d_filiere.get()
+        self.generer(self.docs.liste, niveau, filiere)
+
+    def exporter_excel(self):
+        chemin = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")], initialfile=f"export_universitaire_{date.today():%Y%m%d}.xlsx")
+        if not chemin:
+            return
+        try:
+            with pd.ExcelWriter(chemin, engine="openpyxl") as writer:
+                self.db.etudiants.to_excel(writer, sheet_name="Etudiants", index=False)
+                self.db.notes.to_excel(writer, sheet_name="Notes", index=False)
+                self.db.paiements.to_excel(writer, sheet_name="Paiements", index=False)
+        except PermissionError:
+            messagebox.showerror("Erreur", "Impossible d'écrire ce fichier. Est-il ouvert dans Excel ?")
+            return
+        messagebox.showinfo("Export", f"Export terminé :\n{chemin}")
+
+
+if __name__ == "__main__":
+    Application().mainloop()
+
